@@ -1,0 +1,327 @@
+---
+title: "collaborative_invite_abm"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
+library(rgeos)
+library(influenceR)
+library(tidyverse)
+library(datasets)
+library(sp)
+library(statnet)
+library(NbClust)
+library(ggplot2)
+library(grid)
+library(ggthemes)
+library(GGally)
+library(knitr)
+library(igraph)
+library(data.table)
+library(intergraph)
+library(gridExtra)
+library(networkdiffusion)
+
+```
+
+## Setting up an agent-based model (ABM) for a publicly convened collaborative process.
+The first tasks is simply to set the number of network actors, the number of model simulations, and the type of invitation strategy to use.
+```{r setup}
+n_people = 100
+n_sim = 100
+invite_strategy = 'random'
+tie_threshold = 0.2
+max_update = 0.2
+
+net_start = sample_grg(n_people,tie_threshold,coords=T)
+net_rewired = rewire.ws(g=intergraph::asNetwork(net_start),p = 0.025)
+net_sim = as.network(net_rewired[1,,],matrix.type='adjacency',directed = T,loops = F,multiple=F,hyper = F)
+nb <- invisible(NbClust(cbind(get.vertex.attribute(net_start,'x'),get.vertex.attribute(net_start,'y')), diss=NULL, distance = "euclidean", 
+              min.nc=2, max.nc=5, method = "kmeans", 
+              index = "all", alphaBeale = 0.1))
+best_cl_num = max(nb$Best.partition)
+net_sim %v% 'x_coord' <- get.vertex.attribute(net_start,'x')
+net_sim %v% 'y_coord' <- get.vertex.attribute(net_start,'y')
+net_sim %v% 'coalition' <- nb$Best.partition
+choose_invites = function(strategy,network,n_clusters)
+{
+if(n_clusters == 2) {grab = 8}
+if(n_clusters == 3) {grab = 5}
+if(n_clusters == 4) {grab = 4}
+if(n_clusters == 5) {grab = 3}  
+if (strategy=='brokerage')
+{brokerage = sna::brokerage(network,cl = network %v% 'coalition')
+temp = cbind(brokerage$cl,brokerage$z.nli[,'t']) %>% as.data.frame %>% rename(coalition = V1,brokerage = V2) %>% mutate(ID = 1:nrow(.)) %>% arrange(-brokerage)
+network %v% 'brokerage' = brokerage$z.nli[,'t']
+first_invites = setorder(setDT(data.table(temp)), coalition, -brokerage)[, indx := seq_len(.N), by = coalition][indx <= grab]$ID}
+
+if (strategy=='closeness')
+{temp = data.frame(coalition = network %v% 'coalition',closeness = igraph::closeness(asIgraph(network))) %>% mutate(ID = 1:nrow(.)) %>% arrange(-closeness)
+network %v% 'closeness' = temp$closeness
+first_invites = setorder(setDT(data.table(temp)), coalition, -closeness)[, indx := seq_len(.N), by = coalition][indx <= grab]$ID}
+
+if (strategy=='betweenness')
+{temp = data.frame(coalition = network %v% 'coalition',betweenness = igraph::betweenness(asIgraph(network))) %>% mutate(ID = 1:nrow(.)) %>% arrange(-betweenness)
+network %v% 'betweenness' = temp$betweenness
+first_invites = setorder(setDT(data.table(temp)), coalition, -betweenness)[, indx := seq_len(.N), by = coalition][indx <= grab]$ID}
+  
+if (strategy=='outdegree')
+{temp = data.frame(coalition = network %v% 'coalition',outdeg = sna::degree(network,gmode = 'digraph',cmode = 'outdegree')) %>% mutate(ID = 1:nrow(.)) %>% arrange(-outdeg)
+network %v% 'outdeg' = temp$outdeg
+first_invites = setorder(setDT(data.table(temp)), coalition, -outdeg)[, indx := seq_len(.N), by = coalition][indx <= grab]$ID}
+  
+  if (strategy=='indegree')
+{temp = data.frame(coalition = network %v% 'coalition',indeg = sna::degree(network,gmode = 'digraph',cmode = 'indegree')) %>% mutate(ID = 1:nrow(.)) %>% arrange(-indeg)
+network %v% 'outdeg' = temp$indeg
+first_invites = setorder(setDT(data.table(temp)), coalition, -indeg)[, indx := seq_len(.N), by = coalition][indx <= grab]$ID}
+  
+if (strategy=='random')
+{
+first_invites = unlist(tapply(1:network.size(network),network %v% 'coalition',function(x) sample(x,grab,replace = F)))
+}
+first_invites
+}
+
+net_sim %v% 'invite_random' = ifelse(1:network.size(net_sim) %in% choose_invites(strategy='random',net_sim,best_cl_num),1,0)
+net_sim %v% 'invite_betweenness' = ifelse(1:network.size(net_sim) %in% choose_invites(strategy='betweenness',net_sim,best_cl_num),1,0)
+net_sim %v% 'invite_closeness' = ifelse(1:network.size(net_sim) %in% choose_invites(strategy='closeness',net_sim,best_cl_num),1,0)
+net_sim %v% 'invite_brokerage' = ifelse(1:network.size(net_sim) %in% choose_invites(strategy='brokerage',net_sim,best_cl_num),1,0)
+net_sim %v% 'invite_outdegree' = ifelse(1:network.size(net_sim) %in% choose_invites(strategy='outdegree',net_sim,best_cl_num),1,0)
+net_sim %v% 'invite_indegree' = ifelse(1:network.size(net_sim) %in% choose_invites(strategy='indegree',net_sim,best_cl_num),1,0)
+
+
+net_sim %v% 'deviation' <- runif(network.size(net_sim),0,max_update)
+
+#####
+preferences = list()
+preferences[[1]] <- starting_preferences
+group_centroid = list()
+proportion_pop_approval = list()
+proportion_participant_approval = list()
+individual_participant_approval = list()
+
+participants <- which((net_sim %v% paste0('invite_',invite_strategy)) == 1)
+starting_nodes <- sample(participants,replace=F,size = length(participants))
+starting_preferences = SpatialPoints(cbind(get.vertex.attribute(net_start,'x'),get.vertex.attribute(net_start,'y')))
+group_centroid[[1]] <- gCentroid(starting_preferences[participants,])
+
+proportion_pop_approve[[1]] <- sum(gDistance(group_centroid[[1]],starting_preferences,byid=T) < net_sim %v% 'deviation')/n_people
+
+individual_participant_approval[[1]] <- data.frame(participants,approve = (gDistance(group_centroid[[1]],starting_preferences,byid=T) < 
+                                      (net_sim %v% 'deviation'))[participants])
+
+proportion_participant_approval[[1]] <- sum(individual_participant_approval[[1]]$approve)/nrow(individual_participant_approval[[1]])
+
+
+move_towards <- function(sharer_x,sharer_y,receiver_x,receiver_y,shift_distance,max_shift)
+{d = sqrt((receiver_x-sharer_x)^2 + (receiver_y-sharer_y)^2)
+t = min(shift_distance,max_shift)/d
+cbind(((1-t)*sharer_x + t*receiver_x),((1-t)*sharer_y+t*receiver_y))}
+
+participant_moves = data.frame(preferences[[1]][participants],group_centroid[[1]],
+    moves = ifelse(gDistance(group_centroid[[1]],preferences[[1]][participants],byid=T)< 
+                             (net_sim %v% 'deviation')[participants],
+(net_sim %v% 'deviation')[participants],0),deviation = (net_sim %v% 'deviation')[participants], participants)
+
+participant_preference_update <- do.call(rbind,mapply(function(u,v,w,x,y,z) move_towards(u,v,w,x,y,z) ,
+       participant_moves[,1],
+       participant_moves[,2],
+       participant_moves[,3],
+       participant_moves[,4],
+       participant_moves[,5],
+       participant_moves[,6],SIMPLIFY=FALSE))
+
+data.frame(cbind(rep(NA,network.size(net_sim)),rep(NA,network.size(net_sim))))
+preferences[[2]] <- preferences[[1]]
+preferences[[2]][participants,] <- participant_preference_update
+
+
+
+
+
+data.frame(coordinates(preferences[[1]]),coordinates(group_centroid[[1]]))
+
+
+
+first_set <- ego(asIgraph(net_sim),nodes = starting_nodes)
+first_set <- lapply(first_set,function(x) x[!x%in% starting_nodes])
+
+
+
+
+
+
+
+
+
+
+
+
+transmission_rate = 0.2
+coins = c(1, 0) 
+probabilities = c(transmission_rate, 1-transmission_rate )         
+# sample(coins, 1, rep=TRUE, prob=probabilities) # Generate a sequence
+# toss the coins
+toss = function(freq) {
+  tossing = NULL
+  for (i in 1:freq ) tossing[i] = sample(coins, 1, rep=TRUE, prob=probabilities)
+  tossing = sum(tossing)
+  return (tossing)
+}
+update_diffusers = function(diffusers){
+  nearest_neighbors = data.frame(table(unlist(neighborhood(g, 1, diffusers))))
+  nearest_neighbors = subset(nearest_neighbors, !(nearest_neighbors[,1]%in%diffusers))
+  keep = unlist(lapply(nearest_neighbors[,2], toss))
+  new_infected = as.numeric(as.character(nearest_neighbors[,1][keep >= 1]))
+  diffusers = unique(c(diffusers, new_infected))
+  return(diffusers)}
+
+
+#####
+diffusers = which((net_sim %v% paste0('invite_',invite_strategy)) == 1)
+infected = list()
+infected[[1]]= diffusers
+
+ego(g,nodes = 2,mode = 'out')
+
+###
+total_time = 1
+while(length(infected[[total_time]]) < n_people){ 
+  infected[[total_time+1]] = sort(update_diffusers(infected[[total_time]]))
+  cat(length(infected[[total_time+1]]), "-->")
+  total_time = total_time + 1}
+
+####
+library(animation)
+
+saveGIF({
+  ani.options(interval = 0.5, convert = shQuote("C:/Program Files/ImageMagick-6.8.8-Q16/convert.exe"))
+  # start the plot
+  plot_gif(infected)
+}, ani.width = 800, ani.height = 500)
+
+
+
+
+
+
+
+#####
+
+
+
+
+
+
+####
+set.seed(2014); layout.old = layout.fruchterman.reingold(g, niter = 1000)
+V(g)$color[V(g)%in%diffusers] = "red"
+plot(g, layout =layout.old)
+
+```
+
+Next, we presume that each actor has a policy preference set that is n-dimensional. There is no reason in principle why we could not assume 3 or 4 dimensional preferences, but at this stage for simplicity we assume that preferences are two dimensional. Actors are assumed to be uniformly distributed on each preference dimension between the values of -1 and 1m (again, no reason in principle why the preference distribution could not be normally distributed or skewed; skewed distributions might make for an interesting follow up since they likely more closely reflect what we see in practice).
+
+```{r preferencelocs,echo=F}
+ggplot(ggnetwork(net_sim,layout = cbind(net_sim %v% 'x_coord',net_sim %v% 'y_coord')),aes(x=x,y=y,yend=yend,xend=xend)) + 
+  geom_nodes(colour = 'black') + theme_blank() + 
+  guides(colour = FALSE) 
+```
+Figure 1: 2-dimensional policy preferences space
+
+Next, policy coalitions are a function of the beliefs and preferences that actors hold. Thus, it makes sense to assign actors to a particular policy coalition on the basis of their preference "location" relative to other actors. In the prior draft of the ABM paper, we used k-means clustering to assign a PRESPECIFIED number of coalitions. K-means clustering is an algorithm that takes a specified number of clusters (what we called coalitions) and then assigns each actor to the particular cluster wherein the mean value (the center) of the cluster is closest to the actor's value. The problem with k-means, for our purposes, is that coalitions are based on preferences, not the other way around; in other words, it does not make sense to assign actors to 4 different coalitions if there are 3 primary factions, or vice versa. To address this problem, each time we simulate a preference space, we perform a range of k-means tests with cluster values from 2 to 5. While there are many different ways to assess the optimal number of clusterings, the R package 'NBClust' offers a meta-analytic approach which applies 30 different indices, resulting in a final recommendation based on plurality. We assign each actor to the recommended cluster (representing a policy coalition) and record the number of recommended clusters for later analysis. Figure 1 below presents a 2-dimensional example.
+
+```{r clustering,echo = FALSE}
+ggplot(ggnetwork(net_sim,layout = cbind(net_sim %v% 'x_coord',net_sim %v% 'y_coord')),aes(x=x,y=y,yend=yend,xend=xend)) + 
+  geom_nodes(aes(colour = as.factor(coalition))) + theme_blank() + 
+  guides(colour = FALSE) + scale_colour_colorblind()
+```
+
+Figure 2: 2-dimensional policy preferences space with optimized k-means cluster assignment
+
+After assigning policy preferences and coalition membership, we turn to the consideration of the network ties amongst stakeholders. There are two basic choices here: (1) How many network ties does each actor have? (2) How are ties assigned? Given what we know about how like-minded actors associate within networks, we can use each actor's simulated policy preferences as a basis for simulating network ties. While there are many ways through which this could be accomplished, we use a simple approach that leverages the spatial preference distribution: we assign ties randomly, using the Euclidean distance (in the preference space) between each actor to weight the probability of a tie (such that actors closer in preference are more likely to have a tie). This is done as follows:
+1. Compute a distance matrix showing the distance between each pair of actors in the 'preference plane'
+2. As a starting point, assume that all actors who are within a given distance (the *tie_threshold* variable) have a tie both to and from one-another (i.e., A-->B = B-->A = 1)
+3. "Rewire" this graph using the *rewire.ws* function in the R SNA package. "WS" stands for the Watts-Strogatz "small world" model. To rewire the network the model iteratively considers each edge (a dyad with value of 1) and with a given probabiltiy *p* (which we set at 0.025), exchanges the value of this dyad with a 0-valued dyad that shares an endpoint with the original. For instance, of A-->B = 1 and A-->C = 0, the rewiring process might switch these such that A-->B = 0 and A-->C = 1. The properties of this model serve to preserve short network distances and clustering (both of which are desirable for our simulation since: (a) these phenomena are observed in real world social networks; and (b) based upon a litany of evidence regarding how shared beliefs drive policy network structures, expect actors with more closely matched preferences to have more ties), while serving to perturb the starting graph from an uninteresting (and less realistic) lattice where only the most closely located actors have ties. Further, since the original starting graph is based on proximity in the preference space, the result of the Watts-Strogatz game will stil demonstrate more ties within policy coalitions than between.
+
+Figure 3 below demonstrates an example of a resultant graph:
+```{r edges, echo = FALSE}
+ggplot(ggnetwork(net_sim,layout = cbind(net_sim %v% 'x_coord',net_sim %v% 'y_coord')),aes(x=x,y=y,yend=yend,xend=xend)) + 
+  geom_edges(colour = 'grey80',alpha=0.5,#curvature = 0.15,
+             arrow = arrow(length = unit(0.05, "lines"), type = "closed") ) + 
+  geom_nodes(aes(colour = as.factor(coalition))) + theme_blank() + 
+  guides(colour = FALSE) + scale_colour_colorblind()
+```
+
+After having simulated the network of stakeholders, we can then begin the convening process. In this scenario, a public manager desires to convene a collaborative d to address some issue of collective interest to the network. We assume that the public managers seeks to generate agreement on some unspecified policy, and thus will invite members of the different policy coalitions to participate. We assume that she can follow one of six invitation protocols: (1) invite the most popular actor from each coalition; (2) invite the most "central" actor(s) from each coalition; (3) invite actors from each coalition who are "bridging" actors; (4) invite popular actors with the most incoming ties; (5) elect influential actors with the most outoing ties; or (6) randomly invite actor(s) from each coalition. Table 1 summarizes how these concepts are operationalized:
+
+```{r echo=FALSE}
+data.frame(`Selection method` = c('Popularity','Centrality','Bridging','Indegree','Outdegree','Random'),
+`Measure` = c('# of direct ties to other actors','Betweenness centrality score','Brokerage score',
+              'Most incoming ties','Most outgoing ties',
+              'Uniform random probability'))
+```
+
+Each time we simulate a collaborative process, the convener chooses an invitation strategy, and then invites n number of actors from each coalition according to this strategy. We presume that the convener will desire a basic d size of around 15 individuals. If there are 1, 3, or 5 coalitions, we set this number to 15; if 2 or 4, we set this number to 16. This means, for instance, that if there are 3 coalitions, then the convener invites 5 actors from each coalition.
+
+
+Figure 4 demonstrates an example of each invitation strategy applied to the same network.
+```{r plot_invites,echo=FALSE}
+gg_base <- ggplot(ggnetwork(net_sim,layout = cbind(net_sim %v% 'x_coord',net_sim %v% 'y_coord')),aes(x=x,y=y,yend=yend,xend=xend)) + 
+  geom_edges(colour = 'grey80',alpha=0.5,#curvature = 0.15,
+             arrow = arrow(length = unit(0.05, "lines"), type = "closed") ) + 
+  guides(colour = FALSE,shape=FALSE,fill=FALSE,size=FALSE) + 
+  scale_colour_colorblind() + scale_fill_colorblind() +scale_shape_manual(values = c(1,21)) + 
+  scale_size_manual(values = c(2,3)) + theme_blank()
+
+gg_betweenness = gg_base + geom_nodes(aes(colour = as.factor(coalition),
+                                          shape = as.factor(invite_betweenness),
+                 size = as.factor(invite_betweenness),
+                 fill=as.factor(coalition))) + ggtitle('betweenness')
+
+gg_closeness = gg_base + geom_nodes(aes(colour = as.factor(coalition),
+                                          shape = as.factor(invite_closeness),
+                 size = as.factor(invite_closeness),
+                 fill=as.factor(coalition))) + ggtitle('closeness')
+
+gg_brokerage = gg_base + geom_nodes(aes(colour = as.factor(coalition),
+                                          shape = as.factor(invite_brokerage),
+                 size = as.factor(invite_brokerage),
+                 fill=as.factor(coalition))) + ggtitle('brokerage')
+
+gg_indegree = gg_base + geom_nodes(aes(colour = as.factor(coalition),
+                                          shape = as.factor(invite_indegree),
+                 size = as.factor(invite_indegree),
+                 fill=as.factor(coalition))) + ggtitle('indegree')
+
+gg_outdegree = gg_base + geom_nodes(aes(colour = as.factor(coalition),
+                                          shape = as.factor(invite_outdegree),
+                 size = as.factor(invite_outdegree),
+                 fill=as.factor(coalition))) + ggtitle('outdegree')
+
+gg_random = gg_base + geom_nodes(aes(colour = as.factor(coalition),
+                                          shape = as.factor(invite_random),
+                 size = as.factor(invite_random),
+                 fill=as.factor(coalition))) + ggtitle('random')
+
+grid.arrange(gg_betweenness,gg_closeness,gg_outdegree,gg_indegree,gg_brokerage,gg_random,ncol=3,
+             top=textGrob('Invitation strategy examples', gp=gpar(fontsize=15,font=8)))
+```
+
+Having identified initial participants, we turn to the actual meeting/deliberation process. We presume that the group is seeking to reach some joint agreement. We do not delve into the content of the agreement, but do assume that the agreement relates to the policy preferences held by each participant. In other words, each participants' policy preferences will determine whether or not she votes "yes" or "no" on a given proposal. For a given meeting, we presume that some deliberation process occurs, whereby participants learn about the collective preferences of others. We represent these collective preferences very simply, as the spatial center of the participants' n-dimensional preferences. This is analagous to learning. After this meeting, each participant then has a choice: Whether, and if so, how much, to shift her personal preferences towards that of the group? We assume that independent of policy preferences, each participant also has a "willingness to deviate" -- this is not learning, but rather each actors' willingness to shift preferences in light of new information. For each actor, we randomly assign a 'deviation value' from the sequence 0.00,0.01... 0.20. 
+
+This deviation value determines two features in the model: (1) an actor will "approve" of an agreement when the distance between her preference location and the group proposal is less than or equal to her personal deviation value; and then (2) after a meeting, each actor is allowed to update their preferences by moving towards the group proposal by an amount up to her deviation value.
+
+Of course, the ultimate goal of collaborative governance processes is not simply to generate policy agreement amongst those "in the room" but rather to seek collective solutions that work for stakeholders more broadly and participants are at least somewhat beholden to the policy coalition of which they are a part. Network actors adjust their beliefs and preferences in part based upon information that is shared through network ties. Thus, it makes sense to assume that participants can influence the beliefs of non-participants with whom they are connected, and that these preferences shifts can likewise propogate through a network. Of course, the impact ("quality", if you will) of information likely diminishes as it is shared -- thus, it does not makes sense to model non-participants as shifting preferences an identical amount as the participant with whom they are connected. Instead, we assume the impact of information shared through a network dissipates over multiple connections. We model this simply as a diminishing exponential function, whereby if the focal participant moves towards the group agreement by a total distance of 0.2, then her connections will _at most_ be willing to shift their preferences towards the group agreement by a distance3 of 0.2^2 (subject to the deviation limit for each actor). Preference shifts then propogate through the network accordingly, with each actor being willing to shift towards the group agreement by a distance equal to the square of 
+
+
+Then, secondary connections (i.e., those connected to the focal actor by a 2-path such as A-->B-->C) will at most be willing to shift their by the square of 
+
+We ignore connections beyond this extent. We assume that if a participant is willing to shift preferences by amount x, then a non-participant with whom she is connected will be willing to _at most_ shift up to x/2, subject to their willingness to deviate (if x/2 exceeds the actor's deviation value, then the shift is capped at the deviation value). We assume that a two-path connection will at most be willing to shift up to x/4, again subject to their willingness to deviate. This stage is what makes invitation strategy matter: central actors have more connections, and thus more influence; brokers have connections across coalitions, and thus the ability to influence competing factions.
+
+Thus, after a meeting is held, participants (1) vote; (2) (perhaps) shift their own preferences; and then (3) share information with others, who likewise have an opportunity to shift their preferences. Note that at the "voting" stage, we actually compute two types of votes: (1) level of agreement (yes/no) within the meeting; and (2) level of agreement (yes/no) in the entire population.
+
+```{r}
+choose_invites(strategy='random',net_sim,best_cl_num)
+```
